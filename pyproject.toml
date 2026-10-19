@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "bdzoo"
+version = "1.0.0"
+description = "Clean and backdoored image classifiers with BatchNorm: architectures, poisoning attacks and training"
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.11"
+dependencies = [
+    "torch>=2.6",
+    "torchvision>=0.21",
+    "numpy>=2",
+    "pillow",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8"]
+
+[tool.setuptools]
+packages = ["bdzoo"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
