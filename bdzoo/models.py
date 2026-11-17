@@ -1,11 +1,15 @@
 """Supported architectures. Every model takes inputs in [0, 1] and normalizes internally, so attacks operate in raw
 input space and a checkpoint is self-describing.
 
-    cnn_mlphead              six-convolution BN CNN with the head Linear -> BN1d -> ReLU -> Linear
-    cnn_gap                  the same backbone with BN2d -> ReLU -> GAP -> Linear (fully convolutional)
-    preact_resnet18          pre-activation ResNet-18 ending in BN2d -> ReLU -> GAP -> Linear
-    preact_resnet18_mlphead  pre-activation ResNet-18 with the MLP head of cnn_mlphead
+    preact_resnet18          pre-activation ResNet-18 ending in BN2d -> ReLU -> GAP -> Linear (fully convolutional)
+    preact_resnet18_mlphead  pre-activation ResNet-18 with the MLP head GAP -> Linear -> BN1d -> ReLU -> Linear
+    vgg16_gap                VGG-16-BN ending in Conv -> BN2d -> ReLU -> GAP -> Linear (fully convolutional)
+    vgg16_mlphead            VGG-16-BN with the same MLP head as preact_resnet18_mlphead
     preact_resnet18_bb       BackdoorBench's PreActResNet18 (parameter names as in its released checkpoints)
+
+The ResNets take ``stem='imagenet'`` for 224 px inputs (ImageNet-30): torchvision's 7x7 stride-2 convolution and 3x3
+stride-2 max-pool instead of the 3x3 stride-1 convolution. The VGGs omit the 4096-wide classifier and the max-pool after
+the last feature block.
 
 Register a new architecture with ``@register_arch("name")``.
 """
@@ -61,51 +65,55 @@ def _conv_bn_relu(cin, cout):
     return [nn.Conv2d(cin, cout, 3, padding=1, bias=False), nn.BatchNorm2d(cout), nn.ReLU(inplace=True)]
 
 
-class CNNMLPHead(nn.Module):
-    """Small BN CNN whose final block is exactly Linear -> BN1d -> ReLU -> Linear."""
+VGG16 = [64, 64, "M", 128, 128, "M", 256, 256, 256, "M", 512, 512, 512, "M", 512, 512, 512]
 
-    def __init__(self, num_classes=10, in_channels=3, widths=(64, 128, 256), head_width=256, mean=None, std=None):
+
+class VGGGAP(nn.Module):
+    """VGG-BN ending in Conv -> BN2d -> ReLU -> GAP -> Linear."""
+
+    def __init__(self, cfg, num_classes=10, in_channels=3, mean=None, std=None):
         super().__init__()
         self.norm = _norm(in_channels, mean, std)
         layers: list[nn.Module] = []
         prev = in_channels
-        for i, w in enumerate(widths):
-            layers += _conv_bn_relu(prev, w) + _conv_bn_relu(w, w)
-            if i < len(widths) - 1:
+        for v in cfg:
+            if v == "M":
                 layers.append(nn.MaxPool2d(2))
-            prev = w
+            else:
+                layers += _conv_bn_relu(prev, v)
+                prev = v
         self.features = nn.Sequential(*layers)
         self.pool = nn.AdaptiveAvgPool2d(1)
-        self.head_fc = nn.Linear(prev, head_width)
+        self.fc = nn.Linear(prev, num_classes)
+
+    def forward(self, x):
+        return self.fc(torch.flatten(self.pool(self.features(self.norm(x))), 1))
+
+
+@register_arch("vgg16_gap")
+def vgg16_gap(num_classes=10, in_channels=3, mean=None, std=None):
+    return VGGGAP(VGG16, num_classes, in_channels, mean, std)
+
+
+class VGGMLPHead(VGGGAP):
+    """VGG-BN whose classifier is the MLP head GAP -> Linear -> BN1d -> ReLU -> Linear."""
+
+    def __init__(self, cfg, num_classes=10, in_channels=3, head_width=256, mean=None, std=None):
+        super().__init__(cfg, num_classes, in_channels, mean, std)
+        channels = self.fc.in_features
+        self.head_fc = nn.Linear(channels, head_width)
         self.head_bn = nn.BatchNorm1d(head_width)
         self.head_relu = nn.ReLU(inplace=True)
         self.fc = nn.Linear(head_width, num_classes)
 
     def forward(self, x):
-        x = self.pool(self.features(self.norm(x))).flatten(1)
-        return self.fc(self.head_relu(self.head_bn(self.head_fc(x))))
+        z = torch.flatten(self.pool(self.features(self.norm(x))), 1)
+        return self.fc(self.head_relu(self.head_bn(self.head_fc(z))))
 
 
-@register_arch("cnn_mlphead")
-def cnn_mlphead(num_classes=10, in_channels=3, widths=(64, 128, 256), head_width=256, mean=None, std=None):
-    return CNNMLPHead(num_classes, in_channels, tuple(widths), head_width, mean, std)
-
-
-class CNNGAP(CNNMLPHead):
-    """cnn_mlphead's backbone (same modules and names, last BN2d features.18) with a plain GAP -> Linear classifier."""
-
-    def __init__(self, num_classes=10, in_channels=3, widths=(64, 128, 256), mean=None, std=None):
-        super().__init__(num_classes, in_channels, widths, 1, mean, std)
-        del self.head_fc, self.head_bn, self.head_relu
-        self.fc = nn.Linear(widths[-1], num_classes)
-
-    def forward(self, x):
-        return self.fc(self.pool(self.features(self.norm(x))).flatten(1))
-
-
-@register_arch("cnn_gap")
-def cnn_gap(num_classes=10, in_channels=3, widths=(64, 128, 256), mean=None, std=None):
-    return CNNGAP(num_classes, in_channels, tuple(widths), mean, std)
+@register_arch("vgg16_mlphead")
+def vgg16_mlphead(num_classes=10, in_channels=3, head_width=256, mean=None, std=None):
+    return VGGMLPHead(VGG16, num_classes, in_channels, head_width, mean, std)
 
 
 class PreActBlock(nn.Module):
@@ -130,12 +138,21 @@ class PreActBlock(nn.Module):
 
 
 class PreActResNet(nn.Module):
-    """Pre-activation ResNet; tail BN2d -> ReLU -> GAP -> Linear (the BN input is a residual sum)."""
+    """Pre-activation ResNet; tail BN2d -> ReLU -> GAP -> Linear (the BN input is a residual sum).
 
-    def __init__(self, num_blocks=(2, 2, 2, 2), num_classes=10, in_channels=3, width=64, mean=None, std=None):
+    ``stem``: 'cifar' (3x3 stride-1 convolution, no pooling: 32 and 64 px) or 'imagenet' (7x7 stride-2 convolution and
+    3x3 stride-2 max-pool: 224 px)."""
+
+    def __init__(self, num_blocks=(2, 2, 2, 2), num_classes=10, in_channels=3, width=64, mean=None, std=None, stem='cifar'):
         super().__init__()
+        if stem not in ('cifar', 'imagenet'):
+            raise ValueError(f'unknown stem {stem!r}')
         self.norm = _norm(in_channels, mean, std)
-        self.conv1 = nn.Conv2d(in_channels, width, 3, 1, 1, bias=False)
+        if stem == 'imagenet':
+            self.conv1 = nn.Conv2d(in_channels, width, 7, 2, 3, bias=False)
+            self.stem_pool = nn.MaxPool2d(3, 2, 1)
+        else:
+            self.conv1 = nn.Conv2d(in_channels, width, 3, 1, 1, bias=False)
         layers = []
         cin = width
         for i, nb in enumerate(num_blocks):
@@ -150,8 +167,9 @@ class PreActResNet(nn.Module):
         self.fc = nn.Linear(cin, num_classes)
 
     def stem(self, x):
-        """Normalisation and first convolution: the input of ``layers``."""
-        return self.conv1(self.norm(x))
+        """Normalisation, first convolution and (ImageNet stem) max-pool: the input of ``layers``."""
+        out = self.conv1(self.norm(x))
+        return self.stem_pool(out) if hasattr(self, 'stem_pool') else out
 
     def forward(self, x):
         out = self.layers(self.stem(x))
@@ -159,15 +177,16 @@ class PreActResNet(nn.Module):
 
 
 @register_arch("preact_resnet18")
-def preact_resnet18(num_classes=10, in_channels=3, width=64, mean=None, std=None):
-    return PreActResNet((2, 2, 2, 2), num_classes, in_channels, width, mean, std)
+def preact_resnet18(num_classes=10, in_channels=3, width=64, mean=None, std=None, stem='cifar'):
+    return PreActResNet((2, 2, 2, 2), num_classes, in_channels, width, mean, std, stem)
 
 
 class PreActResNetMLPHead(PreActResNet):
-    """PreAct-ResNet whose classifier is the MLP head GAP -> Linear -> BN1d -> ReLU -> Linear (as in cnn_mlphead)."""
+    """PreAct-ResNet whose classifier is the MLP head GAP -> Linear -> BN1d -> ReLU -> Linear."""
 
-    def __init__(self, num_blocks=(2, 2, 2, 2), num_classes=10, in_channels=3, width=64, head_width=256, mean=None, std=None):
-        super().__init__(num_blocks, num_classes, in_channels, width, mean, std)
+    def __init__(self, num_blocks=(2, 2, 2, 2), num_classes=10, in_channels=3, width=64, head_width=256, mean=None, std=None,
+                 stem='cifar'):
+        super().__init__(num_blocks, num_classes, in_channels, width, mean, std, stem)
         channels = self.fc.in_features
         self.head_fc = nn.Linear(channels, head_width)
         self.head_bn = nn.BatchNorm1d(head_width)
@@ -181,8 +200,8 @@ class PreActResNetMLPHead(PreActResNet):
 
 
 @register_arch("preact_resnet18_mlphead")
-def preact_resnet18_mlphead(num_classes=10, in_channels=3, width=64, head_width=256, mean=None, std=None):
-    return PreActResNetMLPHead((2, 2, 2, 2), num_classes, in_channels, width, head_width, mean, std)
+def preact_resnet18_mlphead(num_classes=10, in_channels=3, width=64, head_width=256, mean=None, std=None, stem='cifar'):
+    return PreActResNetMLPHead((2, 2, 2, 2), num_classes, in_channels, width, head_width, mean, std, stem)
 
 
 class PreActBlockBB(nn.Module):

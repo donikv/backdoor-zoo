@@ -1,4 +1,4 @@
-"""Frozen-head fine-tuning attack (the classifier-freezing adaptive attack evaluated by DFBScanner; threat model TM-H).
+"""Frozen-head fine-tuning attack (the classifier-freezing adaptive attack evaluated by DFBScanner).
 
 A clean checkpoint is fine-tuned on a dirty-label poisoned training set with its whole learned head frozen, so the
 backdoor must be implemented in the layers before it, while every BN layer stays in train mode (honest running
@@ -8,11 +8,13 @@ statistics, including the frozen head BN's):
     --freeze none   control: the same fine-tune with every parameter trainable
 ``--attack clean`` runs the same fine-tune on the clean training set: the matched clean control.
 
-    python -m bdzoo.finetune models/cifar10_cnn_mlphead/seed10/clean --freeze head --attack patch --poison-rate 0.07 --target 3
-    python -m bdzoo.finetune models/cifar10_cnn_mlphead/seed10/clean --freeze head --attack clean
+    python -m bdzoo.finetune models/cifar10_preact_resnet18_mlphead/seed7500/clean --freeze head --attack patch --target 5
+    python -m bdzoo.finetune models/cifar10_preact_resnet18_mlphead/seed7500/clean --freeze head --attack clean
 
-Output: <source run>/<attack>_freeze_<freeze>/{model.pt, meta.json} (or under --out). Paper setting: 10 epochs, learning
-rate 0.01, batch 128, bfloat16 autocast; ``--augment`` for the augmented sources.
+Output: <source run>/<attack>_freeze_<freeze>/{model.pt, meta.json} (or under --out). Paper setting (the defaults): patch or
+blend at 10% poison, 10 epochs, SGD learning rate 0.01, momentum 0.9, cosine schedule, batch 128, bfloat16 autocast, on the
+20 clean MLP-head ResNet test models of CIFAR-10 and ImageNet-30. ImageNet-30's training set is held as uint8, as in
+training.
 """
 from __future__ import annotations
 
@@ -24,16 +26,17 @@ import numpy as np
 import torch
 from torch import nn
 
-from .attacks import trigger
+from .attacks import on_float, trigger
 from .checkpoint import load_checkpoint, save_checkpoint
 from .datasets import dataset_for
-from .train import augment_batch, evaluate
+from .train import ACC_MARGIN, evaluate
 
 FROZEN = {'head': ('head_fc', 'head_bn', 'fc'), 'fc': ('fc',), 'none': ()}
 
 
 def poison(x, y, attack, rate, target, seed, size, alpha):
-    """The same draw as attacks.Poisoned; attack 'clean': the training set unchanged."""
+    """The same draw as attacks.Poisoned; attack 'clean': the training set unchanged. A uint8 training set is triggered on
+    floats and re-quantised, as in training."""
     if attack == 'clean':
         return x.clone(), y.clone(), []
     eligible = [i for i in range(len(y)) if int(y[i]) != target]
@@ -41,12 +44,12 @@ def poison(x, y, attack, rate, target, seed, size, alpha):
     idx = sorted(np.random.default_rng(seed).choice(eligible, count, replace=False).tolist())
     x, y = x.clone(), y.clone()
     t = torch.tensor(idx, dtype=torch.long)
-    x[t] = trigger(x[t], attack, size, alpha)
+    x[t] = on_float(lambda z: trigger(z, attack, size, alpha), x[t])
     y[t] = target
     return x, y, idx
 
 
-def finetune(model, x, y, freeze, device, seed, epochs, lr, batch, amp, augment=False, flip=True):
+def finetune(model, x, y, freeze, device, seed, epochs, lr, batch, amp):
     for name in FROZEN[freeze]:
         for p in model.get_submodule(name).parameters():
             p.requires_grad_(False)
@@ -55,7 +58,6 @@ def finetune(model, x, y, freeze, device, seed, epochs, lr, batch, amp, augment=
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, epochs)
     xs, ys = x.to(device), y.to(device)
     gen = torch.Generator().manual_seed(seed)
-    aug_gen = torch.Generator().manual_seed(seed + 1_000_003)  # as train.PreloadedBatches: the batch order is unchanged
     for _ in range(epochs):
         model.train()  # every BN, frozen or not, records the training batches (honest statistics)
         order = torch.randperm(len(ys), generator=gen).to(device)
@@ -65,7 +67,7 @@ def finetune(model, x, y, freeze, device, seed, epochs, lr, batch, amp, augment=
                 continue
             opt.zero_grad(set_to_none=True)
             with torch.autocast('cuda', dtype=torch.bfloat16, enabled=amp and device.startswith('cuda')):
-                xb = augment_batch(xs[idx], aug_gen, flip) if augment else xs[idx]
+                xb = xs[idx].float().div(255) if xs.dtype == torch.uint8 else xs[idx]
                 loss = nn.functional.cross_entropy(model(xb), ys[idx])
             loss.backward()
             opt.step()
@@ -81,14 +83,12 @@ def main(argv=None):
     ap.add_argument('--out', type=Path, help='output directory (default: <source>/<attack>_freeze_<freeze>)')
     ap.add_argument('--freeze', choices=list(FROZEN), default='head')
     ap.add_argument('--attack', choices=['patch', 'blend', 'clean'], default='patch')
-    ap.add_argument('--poison-rate', type=float, default=0.07)
+    ap.add_argument('--poison-rate', type=float, default=0.1)
     ap.add_argument('--target', type=int, default=0)
     ap.add_argument('--epochs', type=int, default=10)
     ap.add_argument('--lr', type=float, default=0.01)
     ap.add_argument('--batch', type=int, default=128)
     ap.add_argument('--no-amp', dest='amp', action='store_false', help='no bfloat16 autocast')
-    ap.add_argument('--augment', action='store_true', help='random crop + flip of the fine-tuning batches (as train --augment)')
-    ap.add_argument('--no-flip', action='store_true', help='with --augment: random crop only')
     ap.add_argument('--data', default='data')
     ap.add_argument('--device', default='cuda' if torch.cuda.is_available() else 'cpu')
     cli = ap.parse_args(argv)
@@ -97,7 +97,7 @@ def main(argv=None):
     if meta['attack'] != 'clean':
         raise SystemExit(f'{run}: the source must be a clean model')
     x_train, y_train = dataset_for(meta, cli.data, True)
-    x_test, y_test = dataset_for(meta, cli.data, False)
+    x_test, y_test = dataset_for(meta, cli.data, False, uint8=False)
     st = {**meta['settings'], 'poison_rate': 0.0 if cli.attack == 'clean' else cli.poison_rate, 'target': cli.target,
           'label_mode': 'dirty'}
     x, y, idx = poison(x_train, y_train, cli.attack, cli.poison_rate, cli.target, int(meta['seed']), st['trigger_size'], st['alpha'])
@@ -106,18 +106,18 @@ def main(argv=None):
         raise FileExistsError(f'{out} already exists')
     model, model_info = load_checkpoint(run / 'model.pt')
     model = model.to(cli.device)
-    finetune(model, x, y, cli.freeze, cli.device, int(meta['seed']), cli.epochs, cli.lr, cli.batch, cli.amp,
-             cli.augment, not cli.no_flip)
+    finetune(model, x, y, cli.freeze, cli.device, int(meta['seed']), cli.epochs, cli.lr, cli.batch, cli.amp)
     base = evaluate(model, x_test, y_test, cli.attack, st, cli.device)
     out.mkdir(parents=True, exist_ok=True)
     save_checkpoint(out / 'model.pt', model.cpu(), model_info['arch'], model_info['arch_kwargs'])
     new = {'settings': st, 'seed': meta['seed'], 'attack': cli.attack, 'num_poisoned': len(idx), 'poison_indices': idx,
            'baseline': base, 'original_baseline': meta['baseline'], 'source_run': str(run),
            'recalibration': {'mode': f'frozen_head_{cli.freeze}', 'frozen': list(FROZEN[cli.freeze]), 'epochs': cli.epochs,
-                             'lr': cli.lr, 'batch': cli.batch, 'amp': cli.amp, 'augment': cli.augment,
-                             'flip': cli.augment and not cli.no_flip},
+                             'lr': cli.lr, 'batch': cli.batch, 'amp': cli.amp},
            'successful_starting_backdoor': cli.attack != 'clean' and base['asr_non_target'] >= st['min_asr']
-           and base['clean_accuracy'] >= st['min_clean_accuracy']}
+           and base['clean_accuracy'] >= st['min_clean_accuracy'],
+           'usable': base['clean_accuracy'] >= st['min_clean_accuracy'] - ACC_MARGIN
+           and (cli.attack == 'clean' or base['asr_non_target'] >= st['min_asr'])}
     (out / 'meta.json').write_text(json.dumps(new, indent=2))
     print(f"{out}: clean {meta['baseline']['clean_accuracy']:.3f}->{base['clean_accuracy']:.3f} "
           f"ASR -> {base['asr_non_target']:.3f}", flush=True)

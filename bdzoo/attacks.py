@@ -1,5 +1,6 @@
-"""Poisoning attacks. All are dirty-label and all-to-one: a fraction ``rate`` of the whole training set (drawn from the
-non-target images) gets the trigger and the target label.
+"""Poisoning attacks. All are dirty-label. All-to-one (the default): a fraction ``rate`` of the whole training set (drawn
+from the non-target images) gets the trigger and the target label. All-to-all (``label_mode='all2all'``, patch, blend,
+WaNet and SIG): a fraction ``rate`` drawn from all images gets the trigger and the label (y + 1) mod K.
 
     patch        a white ``size`` x ``size`` square in the bottom-right corner (BadNets; 3 px at 32 px)
     blend        a checkerboard blended with weight ``alpha`` (0.2)
@@ -304,26 +305,49 @@ def train_trigger(x, attack, params, ids, ranks, n, seed, role='poison'):
 
 # ---------------------------------------------------------------------------------------------- the poisoned set
 
-class Poisoned(torch.utils.data.Dataset):
-    """The training set ``base`` with ``attack`` planted (nothing when attack == 'clean'): the trigger on a fraction
-    ``rate`` of the whole set, drawn from the non-target images, labelled ``target``. The newer attacks use their reference
-    draws, training-time triggers and cover samples (``cover``: triggered, labels kept)."""
+LABEL_MODES = ('dirty', 'all2all')
 
-    def __init__(self, base, attack, rate, target, seed, size, alpha, num_classes=None, params=None):
+
+def on_float(fn, x):
+    """``fn`` (on [0, 1] floats) applied to an image held as uint8 (ImageNet-30's training set), re-quantised to uint8 as a
+    poisoned image file would be (the trained trigger differs from the float test-time trigger by at most 0.5/255)."""
+    if x.dtype != torch.uint8:
+        return fn(x)
+    return fn(x.float().div(255)).mul(255).round().clamp(0, 255).to(torch.uint8)
+
+
+class Poisoned(torch.utils.data.Dataset):
+    """The training set ``base`` with ``attack`` planted (nothing when attack == 'clean').
+
+        dirty     the trigger on a fraction ``rate`` of the whole set, drawn from the non-target images; label := target.
+                  The newer attacks use their reference draws, training-time triggers and cover samples (``cover``:
+                  triggered, labels kept).
+        all2all   the trigger on a fraction ``rate`` drawn from all images; label := (label + 1) mod num_classes
+
+    Images held as uint8 are triggered on floats and re-quantised (``on_float``)."""
+
+    def __init__(self, base, attack, rate, target, seed, size, alpha, num_classes=None, params=None, label_mode='dirty'):
+        if label_mode not in LABEL_MODES:
+            raise ValueError(f'unknown label mode {label_mode!r}')
         self.base, self.attack, self.target = base, attack, target
         self.size, self.alpha, self.params = size, alpha, params
-        self.num_classes = num_classes
+        self.num_classes, self.label_mode = num_classes, label_mode
         labels = [int(base[i][1]) for i in range(len(base))]
         rng = np.random.default_rng(seed)
         self.cover, self.cover_rank, self.poison_rank, self.seed = set(), {}, {}, seed
         if attack in NEW_ATTACKS:
+            if label_mode != 'dirty':
+                raise ValueError(f'{attack}: all-to-one only')
             poison, cover = draw(attack, labels, rate, target, num_classes, params, rng)
             self.indices, self.cover = set(poison), set(cover)
             self.poison_rank = {i: k for k, i in enumerate(poison)}
             self.cover_rank = {i: k for k, i in enumerate(cover)}
             self.cross = set()
             return
-        eligible = [i for i in range(len(base)) if labels[i] != target]
+        if label_mode == 'all2all':
+            eligible = list(range(len(base)))
+        else:
+            eligible = [i for i in range(len(base)) if labels[i] != target]
         # The rate is relative to the entire training set.
         count = min(len(eligible), int(rate * len(base))) if attack != 'clean' else 0
         self.indices = set(rng.choice(eligible, count, replace=False).tolist())
@@ -341,18 +365,18 @@ class Poisoned(torch.utils.data.Dataset):
     def __getitem__(self, i):
         x, y = self.base[i]
         if i in self.cover:
-            x = train_trigger(x.unsqueeze(0), self.attack, self.params, [i], [self.cover_rank[i]], len(self.cover),
-                              self.seed, 'cover')[0]
+            x = on_float(lambda v: train_trigger(v.unsqueeze(0), self.attack, self.params, [i], [self.cover_rank[i]],
+                                                 len(self.cover), self.seed, 'cover')[0], x)
             return x, int(y)
         if i in self.cross:
-            return wanet_warp(x.unsqueeze(0), self.params, wanet_noise(self.seed, i, *x.shape[-2:]))[0], int(y)
+            return on_float(lambda v: wanet_warp(v.unsqueeze(0), self.params, wanet_noise(self.seed, i, *v.shape[-2:]))[0], x), int(y)
         if i in self.indices:
             if self.attack in NEW_ATTACKS:
-                x = train_trigger(x.unsqueeze(0), self.attack, self.params, [i], [self.poison_rank[i]], len(self.indices),
-                                  self.seed)[0]
+                x = on_float(lambda v: train_trigger(v.unsqueeze(0), self.attack, self.params, [i], [self.poison_rank[i]],
+                                                     len(self.indices), self.seed)[0], x)
             else:
-                x = trigger(x.unsqueeze(0), self.attack, self.size, self.alpha, self.params)[0]
-            y = self.target
+                x = on_float(lambda v: trigger(v.unsqueeze(0), self.attack, self.size, self.alpha, self.params)[0], x)
+            y = (int(y) + 1) % self.num_classes if self.label_mode == 'all2all' else self.target
         return x, int(y)
 
 

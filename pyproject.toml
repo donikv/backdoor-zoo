@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "bdzoo"
-version = "1.0.0"
+version = "2.0.0"
 description = "Clean and backdoored image classifiers with BatchNorm: architectures, poisoning attacks and training"
 readme = "README.md"
 license = { file = "LICENSE" }

@@ -1,16 +1,26 @@
 """Train one clean or backdoored model and record its clean accuracy, attack success rate (ASR) and eligibility.
 
-    python -m bdzoo.train --dataset cifar10 --arch cnn_mlphead --attack blend --poison-rate 0.1 --seed 0 --out models
-    python -m bdzoo.train --dataset cifar10 --arch cnn_mlphead --attack clean --seed 800 --out models
+    python -m bdzoo.train --dataset cifar10 --arch preact_resnet18_mlphead --attack blend --poison-rate 0.1 --seed 7000 --target 5
+    python -m bdzoo.train --dataset cifar10 --arch preact_resnet18_mlphead --attack clean --seed 8000
+    python -m bdzoo.train --dataset imagenet30_112 --arch vgg16_gap --attack patch --poison-rate 0.01 --seed 7001 --target 12
+    python -m bdzoo.train --dataset cifar10 --arch preact_resnet18 --attack patch --poison-rate 0.05 --label-mode all2all
 
 Output: <out>/<dataset>_<arch>/seed<seed>/<attack>/{model.pt, meta.json}. model.pt holds only the architecture and the
 weights; meta.json (evaluator side) holds the settings, the poison indices and the test metrics.
 
 Recipe (the defaults): SGD with momentum 0.9, weight decay 5e-4, learning rate 0.1, cosine schedule, batch 128,
 bfloat16 autocast on CUDA, no augmentation; epochs, clean-accuracy bar, target and patch size per dataset and
-architecture as in EPOCHS, BARS, TARGETS and trigger_size. A backdoor is eligible when its ASR reaches 0.9 (0.5 for
-the newer attacks) and its clean accuracy reaches the dataset's bar. ``--augment`` adds random crop (zero padding 4) and
-horizontal flip. BackdoorBench's clean-model recipe for the released-checkpoint comparison:
+architecture as in EPOCHS, BARS, TARGETS and trigger_size (3 px at 32 px, 6 at 64, 10 at 112, 21 at 224). The ResNets
+use the ImageNet stem above 64 px. Training sets with images above 64 px (ImageNet-30) are held as uint8; their triggers
+are applied on floats and re-quantised.
+
+A model is usable (meta.json ``usable``) when its clean accuracy is at most 0.05 below the dataset's bar and, for a
+backdoor, its ASR reaches 0.9 (patch, blend, WaNet, SIG) or 0.5 (Adap-Blend, Adap-Patch, TaCT, FTrojan). The stricter
+``successful_starting_backdoor`` also requires the full accuracy bar. All-to-all models (``--label-mode all2all``) are
+measured by the share of triggered test images predicted as (label + 1) mod K.
+
+BackdoorBench's clean-model recipe for the released-checkpoint comparison (``--augment``: random crop with zero padding 4
+and horizontal flip):
     python -m bdzoo.train --dataset cifar10 --arch preact_resnet18_bb --attack clean --epochs 100 --lr 0.01 --augment --seed 0
 
 Training is deterministic given the seed (the batch order, poison draw and initialisation all derive from it).
@@ -29,21 +39,25 @@ from torch.utils.data import TensorDataset
 
 from . import attacks
 from .checkpoint import save_checkpoint
-from .datasets import info, load
+from .datasets import held_as_uint8, info, load
 from .models import build_model
 
-ARCHS = ('cnn_mlphead', 'cnn_gap', 'preact_resnet18', 'preact_resnet18_mlphead', 'preact_resnet18_bb')
-EPOCHS = {'cifar10': {'cnn_mlphead': 100, 'cnn_gap': 100, 'preact_resnet18_mlphead': 60, 'preact_resnet18': 60,
-                      'preact_resnet18_bb': 100},
-          'cifar100': {'cnn_mlphead': 100, 'cnn_gap': 100, 'preact_resnet18_mlphead': 60, 'preact_resnet18': 60},
-          'gtsrb': {'cnn_mlphead': 40, 'cnn_gap': 40, 'preact_resnet18_mlphead': 40, 'preact_resnet18': 40},
-          'tinyimagenet': {'cnn_mlphead': 40, 'cnn_gap': 40, 'preact_resnet18_mlphead': 40, 'preact_resnet18': 40}}
-BARS = {'cifar10': 0.8, 'cifar100': 0.55, 'gtsrb': 0.9, 'tinyimagenet': 0.4}
-TARGETS = {'cifar10': 0, 'cifar100': 0, 'gtsrb': 2, 'tinyimagenet': 0}  # GTSRB class 0 has only 210 training images
+ARCHS = ('preact_resnet18_mlphead', 'preact_resnet18', 'vgg16_mlphead', 'vgg16_gap', 'preact_resnet18_bb')
+RESNETS = ('preact_resnet18_mlphead', 'preact_resnet18')
+VGGS = ('vgg16_mlphead', 'vgg16_gap')
+EPOCHS = {'cifar10': {**dict.fromkeys(RESNETS + VGGS, 60), 'preact_resnet18_bb': 100},
+          'cifar100': dict.fromkeys(RESNETS, 60),
+          'gtsrb': dict.fromkeys(RESNETS, 40),
+          'tinyimagenet': dict.fromkeys(RESNETS, 40),
+          'imagenet30': dict.fromkeys(RESNETS, 40),
+          'imagenet30_112': dict.fromkeys(VGGS, 40)}
+BARS = {'cifar10': 0.8, 'cifar100': 0.55, 'gtsrb': 0.9, 'tinyimagenet': 0.4, 'imagenet30': 0.5, 'imagenet30_112': 0.5}
+TARGETS = {'cifar10': 0, 'cifar100': 0, 'gtsrb': 2, 'tinyimagenet': 0, 'imagenet30': 0, 'imagenet30_112': 0}
+ACC_MARGIN = 0.05  # a model is usable at most this far below the dataset's clean-accuracy bar
 
 
 def trigger_size(dataset: str) -> int:
-    """The patch side: 3 px at 32 px, scaled with the image side (6 px at 64)."""
+    """The patch side: 3 px at 32 px, scaled with the image side (6 at 64, 10 at 112, 21 at 224)."""
     return max(3, round(3 * info(dataset)['image_size'] / 32))
 
 
@@ -91,17 +105,22 @@ class PreloadedBatches:
         order = torch.randperm(len(self.y), generator=self.generator).to(self.x.device)
         for b in range(0, len(order), self.batch_size):
             idx = order[b:b + self.batch_size]
-            x = augment_batch(self.x[idx], self.aug_generator, self.flip) if self.augment else self.x[idx]
+            x = self.x[idx]
+            x = x.float().div(255) if x.dtype == torch.uint8 else x  # uint8 training sets become float per batch
+            x = augment_batch(x, self.aug_generator, self.flip) if self.augment else x
             yield x, self.y[idx]
         torch.randperm(len(self.y), generator=self.generator)  # RandomSampler's discarded tail permutation
 
 
-def metrics(clean, attacked, y, target, source=None):
-    """``asr_non_target``: triggered non-target images predicted as the target; with ``source`` (TaCT), triggered
-    source-class images predicted as the target, and ``asr_other_classes`` the same for the remaining non-target classes."""
+def metrics(clean, attacked, y, target, source=None, label_mode='dirty'):
+    """``asr_non_target``: triggered non-target images predicted as the target; for all-to-all, triggered images predicted
+    as (label + 1) mod K; with ``source`` (TaCT), triggered source-class images predicted as the target, and
+    ``asr_other_classes`` the same for the remaining non-target classes."""
     pred, apred = clean.argmax(1), attacked.argmax(1)
     extra = {}
-    if source is not None:
+    if label_mode == 'all2all':
+        asr = float((apred == (y + 1) % clean.shape[1]).float().mean())
+    elif source is not None:
         asr = float((apred[y == source] == target).float().mean())
         extra['asr_other_classes'] = float((apred[(y != target) & (y != source)] == target).float().mean())
     else:
@@ -129,8 +148,17 @@ def evaluate(model, x_test, y_test, attack, settings, device, batch=1000):
         clean.append(model(xb).cpu())
         attacked.append(model(attacks.trigger(xb, attack, settings['trigger_size'], settings['alpha'],
                                               settings.get('trigger_params'))).cpu())
-    out = metrics(torch.cat(clean), torch.cat(attacked), y_test, settings['target'])
+    out = metrics(torch.cat(clean), torch.cat(attacked), y_test, settings['target'], label_mode=settings.get('label_mode', 'dirty'))
     return {k: v for k, v in out.items() if k != 'per_class_accuracy'}
+
+
+def usable(meta: dict) -> bool:
+    """The paper's model criterion: clean accuracy at most ACC_MARGIN below the run's bar, and for a backdoor an ASR at or
+    above its attack's bar."""
+    b, s = meta['baseline'], meta['settings']
+    if b['clean_accuracy'] < s['min_clean_accuracy'] - ACC_MARGIN:
+        return False
+    return meta['attack'] == 'clean' or b['asr_non_target'] >= meta['asr_bar']
 
 
 def run(args):
@@ -140,8 +168,8 @@ def run(args):
         from torchvision.datasets import CIFAR10, CIFAR100
         for train in (True, False):
             (CIFAR10 if args.dataset == 'cifar10' else CIFAR100)(args.data, train=train, download=True)
-    # Same values and order as torchvision's dataset with ToTensor (uint8 / 255).
-    x, y, meta_data = load(args.dataset, True, args.data)
+    # Same values and order as torchvision's dataset with ToTensor (uint8 / 255); images above 64 px stay uint8.
+    x, y, meta_data = load(args.dataset, True, args.data, uint8=held_as_uint8(args.dataset))
     xt, yt, _ = load(args.dataset, False, args.data)
     train, test = TensorDataset(x, y), TensorDataset(xt, yt)
     if args.train_size:
@@ -150,13 +178,15 @@ def run(args):
         test = torch.utils.data.Subset(test, range(min(args.test_size, len(test))))
     classes = meta_data['num_classes']
     kwargs = {'num_classes': classes, 'in_channels': 3, 'mean': meta_data['mean'], 'std': meta_data['std']}
+    if meta_data['image_size'] > 64 and args.arch in RESNETS:
+        kwargs['stem'] = 'imagenet'
     if not 0 <= args.target < classes:
         raise ValueError('target outside class range')
     params = trigger_params(args, seed)
     if attack in attacks.NEW_ATTACKS:
         params |= attacks.resolved(attack, params)
     poisoned = attacks.Poisoned(train, attack, args.poison_rate, args.target, seed, args.trigger_size, args.alpha, classes,
-                                params)
+                                params, args.label_mode)
     out = Path(args.out) / f'{args.dataset}_{args.arch}' / f'seed{seed}' / attack
     if out.exists():
         raise FileExistsError(f'{out} already exists; choose a new --out to preserve results')
@@ -188,7 +218,7 @@ def run(args):
     evaluation_attack = 'patch' if attack == 'clean' else attack
     clean = test_logits(model, xs, 'clean', args.trigger_size, args.alpha, params, args.device, args.batch_size)
     attacked = test_logits(model, xs, evaluation_attack, args.trigger_size, args.alpha, params, args.device, args.batch_size)
-    baseline = metrics(clean, attacked, ys, args.target, attacks.asr_source(attack, args.target, classes, params))
+    baseline = metrics(clean, attacked, ys, args.target, attacks.asr_source(attack, args.target, classes, params), args.label_mode)
     asr_bar = args.min_asr_new if attack in attacks.NEW_ATTACKS else args.min_asr
     meta = {'settings': {**vars(args), 'trigger_params': params}, 'seed': seed, 'attack': attack,
             'num_poisoned': len(poisoned.indices), 'poison_indices': sorted(poisoned.indices),
@@ -197,9 +227,10 @@ def run(args):
             'history': history, 'baseline': baseline, 'evaluation_attack': evaluation_attack,
             'successful_starting_backdoor': attack != 'clean' and baseline['asr_non_target'] >= asr_bar
             and baseline['clean_accuracy'] >= args.min_clean_accuracy}
+    meta['usable'] = usable(meta)
     (out / 'meta.json').write_text(json.dumps(meta, indent=2))
     print(json.dumps({'out': str(out), **{k: v for k, v in baseline.items() if k != 'per_class_accuracy'},
-                      'eligible': meta['successful_starting_backdoor']}), flush=True)
+                      'usable': meta['usable']}), flush=True)
     return out
 
 
@@ -209,6 +240,8 @@ def build_parser():
     p.add_argument('--arch', choices=ARCHS, required=True)
     p.add_argument('--attack', choices=['clean', *attacks.ATTACKS], required=True)
     p.add_argument('--poison-rate', type=float, default=0.1, help='poisoned fraction of the whole training set')
+    p.add_argument('--label-mode', choices=attacks.LABEL_MODES, default='dirty',
+                   help='dirty: all-to-one (default); all2all: label (y + 1) mod K (patch, blend, WaNet, SIG)')
     p.add_argument('--seed', type=int, default=0)
     p.add_argument('--target', type=int, help='target class (default: TARGETS[dataset])')
     p.add_argument('--epochs', type=int, help='default: EPOCHS[dataset][arch]')
@@ -226,7 +259,8 @@ def build_parser():
     p.add_argument('--sig-f', type=float, default=attacks.TRIGGER_DEFAULTS['sig_f'], help='SIG frequency (periods per width)')
     p.add_argument('--cover-ratio', type=float, help='newer attacks: cover samples per poison sample (default: the reference ratio)')
     p.add_argument('--trigger-dir', default=attacks.TRIGGER_DIR, help='trigger images of the newer attacks (bdzoo.attacks --fetch)')
-    p.add_argument('--augment', action='store_true', help='random crop + horizontal flip (batch order unchanged)')
+    p.add_argument('--augment', action='store_true', help='random crop + horizontal flip (batch order unchanged; the '
+                   'BackdoorBench clean recipe)')
     p.add_argument('--no-flip', action='store_true', help='with --augment: random crop only')
     p.add_argument('--min-asr', type=float, default=0.9)
     p.add_argument('--min-asr-new', type=float, default=attacks.MIN_ASR, help='ASR bar of the newer attacks')
@@ -256,6 +290,8 @@ def resolve(p, args):
         p.error('invalid training or trigger parameters')
     if args.no_flip and not args.augment:
         p.error('--no-flip needs --augment')
+    if args.label_mode == 'all2all' and args.attack in attacks.NEW_ATTACKS:
+        p.error(f'{args.attack} is all-to-one only')
     return args
 
 
