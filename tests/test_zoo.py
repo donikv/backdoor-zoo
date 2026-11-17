@@ -8,7 +8,7 @@ from torch.utils.data import DataLoader, TensorDataset
 from bdzoo import attacks, build_model, list_archs, load_checkpoint, save_checkpoint
 from bdzoo.attacks import Poisoned, cross_inputs, poisoned_inputs, trigger
 from bdzoo.finetune import poison
-from bdzoo.train import PreloadedBatches, build_parser, metrics, resolve, trigger_params
+from bdzoo.train import PreloadedBatches, build_parser, metrics, resolve, trigger_params, usable
 
 
 def _image_set(n=60, classes=3):
@@ -31,25 +31,88 @@ def _meta_of(ds, attack, seed, params):
 
 def _params(seed):
     p = build_parser()
-    return trigger_params(resolve(p, p.parse_args(['--dataset', 'cifar10', '--arch', 'cnn_mlphead', '--attack', 'wanet'])), seed)
+    return trigger_params(resolve(p, p.parse_args(['--dataset', 'cifar10', '--arch', 'preact_resnet18_mlphead',
+                                                   '--attack', 'wanet'])), seed)
 
 
-@pytest.mark.parametrize('arch', ['cnn_mlphead', 'cnn_gap', 'preact_resnet18', 'preact_resnet18_mlphead', 'preact_resnet18_bb'])
-def test_models_build_run_and_round_trip(arch, tmp_path):
+@pytest.mark.parametrize('arch,kw,size', [('preact_resnet18', {}, 32), ('preact_resnet18_mlphead', {}, 32),
+                                          ('vgg16_gap', {}, 32), ('vgg16_mlphead', {}, 112), ('preact_resnet18_bb', {}, 32),
+                                          ('preact_resnet18', {'stem': 'imagenet'}, 224),
+                                          ('preact_resnet18_mlphead', {'stem': 'imagenet'}, 224)])
+def test_models_build_run_and_round_trip(arch, kw, size, tmp_path):
     assert arch in list_archs()
-    model = build_model(arch, num_classes=7).eval()
-    x = torch.rand(2, 3, 32, 32)
-    save_checkpoint(tmp_path / 'model.pt', model, arch, {'num_classes': 7})
+    model = build_model(arch, num_classes=7, **kw).eval()
+    x = torch.rand(2, 3, size, size)
+    save_checkpoint(tmp_path / 'model.pt', model, arch, {'num_classes': 7, **kw})
     loaded, info = load_checkpoint(tmp_path / 'model.pt')
-    assert info['arch'] == arch and torch.equal(loaded(x), model(x)) and loaded(x).shape == (2, 7)
+    with torch.no_grad():
+        assert info['arch'] == arch and torch.equal(loaded(x), model(x)) and loaded(x).shape == (2, 7)
+    assert hasattr(model, 'stem_pool') == (kw.get('stem') == 'imagenet')
+
+
+def test_vgg16_layout():
+    m = build_model('vgg16_gap')
+    convs = [l for l in m.features if isinstance(l, torch.nn.Conv2d)]
+    pools = [l for l in m.features if isinstance(l, torch.nn.MaxPool2d)]
+    assert len(convs) == 13 and len(pools) == 4 and isinstance(m.features[-1], torch.nn.ReLU)
+    assert isinstance(m.features[-2], torch.nn.BatchNorm2d) and m.fc.in_features == 512
+    h = build_model('vgg16_mlphead')
+    assert (h.head_fc.out_features, h.head_bn.num_features, h.fc.in_features) == (256, 256, 256)
 
 
 def test_recipe_defaults():
     p = build_parser()
     a = resolve(p, p.parse_args(['--dataset', 'gtsrb', '--arch', 'preact_resnet18_mlphead', '--attack', 'patch']))
     assert (a.epochs, a.target, a.trigger_size, a.min_clean_accuracy, a.lr, a.batch_size, a.amp) == (40, 2, 3, .9, .1, 128, True)
-    a = resolve(p, p.parse_args(['--dataset', 'tinyimagenet', '--arch', 'cnn_mlphead', '--attack', 'blend']))
-    assert (a.epochs, a.trigger_size, a.min_clean_accuracy) == (40, 6, .4)
+    expected = {('cifar10', 'preact_resnet18'): (60, 3, .8), ('cifar10', 'vgg16_mlphead'): (60, 3, .8),
+                ('cifar100', 'preact_resnet18_mlphead'): (60, 3, .55), ('tinyimagenet', 'preact_resnet18'): (40, 6, .4),
+                ('imagenet30', 'preact_resnet18_mlphead'): (40, 21, .5), ('imagenet30_112', 'vgg16_gap'): (40, 10, .5)}
+    for (ds, arch), want in expected.items():
+        a = resolve(p, p.parse_args(['--dataset', ds, '--arch', arch, '--attack', 'blend']))
+        assert (a.epochs, a.trigger_size, a.min_clean_accuracy, a.label_mode) == (*want, 'dirty')
+    with pytest.raises(SystemExit):  # the newer attacks are all-to-one only
+        resolve(p, p.parse_args(['--dataset', 'cifar10', '--arch', 'preact_resnet18', '--attack', 'tact', '--label-mode', 'all2all']))
+
+
+def test_usable_rule():
+    meta = {'attack': 'tact', 'asr_bar': .5, 'settings': {'min_clean_accuracy': .9},
+            'baseline': {'clean_accuracy': .86, 'asr_non_target': 1.0}}
+    assert usable(meta)  # 0.04 below the bar: usable
+    assert not usable({**meta, 'baseline': {'clean_accuracy': .84, 'asr_non_target': 1.0}})
+    assert not usable({**meta, 'baseline': {'clean_accuracy': .95, 'asr_non_target': .49}})
+    assert usable({**meta, 'attack': 'clean', 'baseline': {'clean_accuracy': .85, 'asr_non_target': 0.}})
+
+
+def test_all_to_all_poisoning():
+    x, y = torch.rand(60, 3, 8, 8), torch.arange(60) % 3
+    ds = Poisoned(TensorDataset(x, y), 'patch', .2, 0, 4, 3, .2, num_classes=3, label_mode='all2all')
+    assert len(ds.indices) == 12  # drawn from all images, the target class included
+    for i in range(60):
+        xi, yi = ds[i]
+        if i in ds.indices:
+            assert yi == (int(y[i]) + 1) % 3 and torch.all(xi[:, -3:, -3:] == 1)
+        else:
+            assert yi == int(y[i]) and torch.equal(xi, x[i])
+    labels = torch.tensor([0, 1, 2, 2])
+    attacked = torch.eye(3)[torch.tensor([1, 2, 0, 2])]
+    assert metrics(torch.eye(3)[labels], attacked, labels, 0, label_mode='all2all')['asr_non_target'] == .75
+
+
+def test_uint8_training_sets_are_poisoned_on_floats():
+    g = torch.Generator().manual_seed(1)
+    x8 = torch.randint(0, 256, (40, 3, 16, 16), generator=g, dtype=torch.uint8)
+    y = torch.arange(40) % 4
+    p8 = Poisoned(TensorDataset(x8, y), 'blend', .25, 0, 5, 3, .2)
+    pf = Poisoned(TensorDataset(x8.float() / 255, y), 'blend', .25, 0, 5, 3, .2)
+    assert p8.indices == pf.indices
+    for i in sorted(p8.indices):
+        a, b = p8[i][0], pf[i][0]
+        assert a.dtype == torch.uint8 and torch.equal(a, b.mul(255).round().clamp(0, 255).to(torch.uint8))
+    xp, _, idx = poison(x8, y, 'patch', .25, 0, 5, 3, .2)
+    assert xp.dtype == torch.uint8 and all(torch.all(xp[i, :, -3:, -3:] == 255) for i in idx)
+    batches = PreloadedBatches(p8, 16, 0, 'cpu')
+    xb, _ = next(iter(batches))
+    assert xb.dtype == torch.float32 and float(xb.max()) <= 1
 
 
 def test_poisoning_preserves_target_examples_and_source():
@@ -222,17 +285,94 @@ def test_dataset_loaders():
     from bdzoo.datasets import info, load
 
     present = {'cifar10': 'data/cifar-10-batches-py', 'cifar100': 'data/cifar-100-python',
-               'gtsrb': 'data/gtsrb/GTSRB', 'tinyimagenet': 'data/tiny-imagenet-200/wnids.txt'}
-    sizes = {'cifar10': (50000, 10000), 'cifar100': (50000, 10000), 'gtsrb': (26640, 12630), 'tinyimagenet': (100000, 10000)}
+               'gtsrb': 'data/gtsrb/GTSRB', 'tinyimagenet': 'data/tiny-imagenet-200/wnids.txt',
+               'imagenet30': 'data/imagenet30/test', 'imagenet30_112': 'data/imagenet30/test'}
+    sizes = {'cifar10': (50000, 10000), 'cifar100': (50000, 10000), 'gtsrb': (26640, 12630), 'tinyimagenet': (100000, 10000),
+             'imagenet30': (39000, 3000), 'imagenet30_112': (39000, 3000)}
     checked = 0
     for name, path in present.items():
         if not Path(path).exists():
             continue
         meta = info(name)
         for train, n in zip((True, False), sizes[name]):
-            x, y, _ = load(name, train, 'data')
-            assert x.shape == (n, 3, meta['image_size'], meta['image_size']) and x.dtype == torch.float32
+            x, y, _ = load(name, train, 'data', uint8=True)
+            assert x.shape == (n, 3, meta['image_size'], meta['image_size']) and x.dtype == torch.uint8
             assert int(y.max()) + 1 == meta['num_classes'] and int(y.min()) == 0
         checked += 1
     if not checked:
         pytest.skip('no dataset present')
+
+
+# ---------------------------------------------------------------------------------------------- filtering streams
+
+def _stream_meta(attack='patch', mode='dirty', target=0):
+    return {'attack': attack, 'seed': 0, 'settings': {'label_mode': mode, 'target': target, 'trigger_size': 3, 'alpha': .2,
+                                                      'trigger_params': {}}}
+
+
+def _stream_preds(n=600, K=5, seed=0):
+    import numpy as np
+    rng = np.random.default_rng(seed)
+    y = rng.integers(0, K, n)
+    return y, y.copy(), np.where(rng.random(n) < .8, 0, y)
+
+
+def test_stream_subset_and_detector_split():
+    import numpy as np
+    from bdzoo import streams
+    a = streams.subset(10000, 5000)
+    assert len(a) == 5000 and np.all(np.diff(a) > 0) and np.array_equal(a, streams.subset(10000, 5000))
+    assert np.array_equal(streams.subset(3000, 3000), np.arange(3000))
+    val, ovl, ev = streams.detector_split(10000, a)  # enough test images outside the subset
+    assert (len(val), len(ovl)) == (2000, 3000) and np.array_equal(ev, np.arange(5000))
+    assert not set(val) & set(a) and not set(ovl) & set(a) and not set(val) & set(ovl)
+    idx = np.arange(3000)  # the subset is the whole test set: 500 + 500 of it, evaluated on the rest
+    val, ovl, ev = streams.detector_split(3000, idx)
+    assert (len(val), len(ovl), len(ev)) == (500, 500, 2000) and not set(val) & set(ev) and not set(ovl) & set(ev)
+    assert set(val) | set(ovl) | set(ev) == set(range(3000)) and streams.IMAGES['imagenet30'] == 3000
+
+
+def test_stream_draws_all_to_one():
+    import numpy as np
+    from bdzoo import streams
+    y, pc, pt = _stream_preds()
+    meta = _stream_meta()
+    hit = (y != 0) & (pt == 0)
+    subs = streams.draws(meta, y, pc, pt, 5)
+    n = int(round(.1 / .9 * (pc == 0).sum()))
+    assert len(subs) == streams.DRAWS and all(len(s) == n == len(set(s)) and hit[s].all() for s in subs)
+    assert all(np.array_equal(s, t) for s, t in zip(subs, streams.draws(meta, y, pc, pt, 5)))
+    assert len({tuple(s) for s in subs}) == streams.DRAWS
+    assert streams.draws(meta, y, pc, np.where(pt == 0, 1, pt), 5) is None  # no hit: the stream cannot be built
+    assert streams.asr(meta, y, pt, 5) == float(hit[y != 0].mean())
+    tact = _stream_meta('tact')
+    src = attacks.asr_source('tact', 0, 5)
+    assert np.array_equal(streams.eligible(tact, y, 5), y == src)
+
+
+def test_stream_draws_all_to_all():
+    import numpy as np
+    from bdzoo import streams
+    rng = np.random.default_rng(1)
+    K, n = 5, 2000
+    y = rng.integers(0, K, n)
+    pc = y.copy()
+    pt = np.where(rng.random(n) < .7, (y + 1) % K, y)
+    meta = _stream_meta(mode='all2all')
+    hit = pt == (y + 1) % K
+    assert streams.asr(meta, y, pt, K) == float(hit.mean())
+    for s in streams.draws(meta, y, pc, pt, K, 'per_class'):
+        assert hit[s].all() and len(set(s)) == len(s)
+        for c in range(K):
+            assert (pt[s] == c).sum() == min(int(round(.1 / .9 * (pc == c).sum())), (hit & (pt == c)).sum())
+    for s in streams.draws(meta, y, pc, pt, K, 'sparse'):
+        assert hit[s].all() and len(s) == int(round(.01 / .99 * n))
+    with pytest.raises(ValueError):
+        streams.draws(meta, y, pc, pt, K, 'dense')
+
+
+def test_triggered_stream_copies():
+    from bdzoo import streams
+    x = torch.rand(7, 3, 32, 32)
+    xt = streams.triggered(x, _stream_meta(), batch=3)
+    assert torch.equal(xt, trigger(x, 'patch', 3, .2)) and not torch.equal(xt, x)
