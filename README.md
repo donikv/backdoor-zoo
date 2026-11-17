@@ -6,7 +6,6 @@ and `meta.json` (settings, poison indices, clean accuracy, attack success rate a
 
 This is the model zoo of the paper *BAND: Backdoor Detection through Batch Normalization Statistics*. The detector lives in
 [BAND](https://github.com/donikv/BAND) and the baselines in [backdoor-baselines](https://github.com/donikv/backdoor-baselines).
-The version of the CSF submission is tagged `csf-2027`.
 
 ## Install
 
